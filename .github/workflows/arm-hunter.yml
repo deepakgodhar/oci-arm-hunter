@@ -1,14 +1,15 @@
 name: arm-hunter
 
 # Hunts for Always-Free Ampere A1 (ARM) capacity and creates the instance the
-# moment a slot frees up. Runs every 5 minutes until it succeeds, then disables
-# itself and opens an issue to notify you.
+# moment a slot frees up. Each run loops internally (every 5 min for ~5.5h);
+# the cron just restarts the loop. On success it opens an issue and disables
+# itself. Kicked off continuously without relying on GitHub's flaky cron.
 
 on:
   schedule:
-    # Every 5 min, but offset off the congested round minutes (:00/:05) to
-    # reduce GitHub's scheduler delay: fires at :03, :08, :13, :18 ...
-    - cron: "3-59/5 * * * *"
+    # Backup only. Each run loops internally for ~5.5h, so cron just needs to
+    # fire occasionally to start the next long loop. Offset off round minutes.
+    - cron: "7,37 * * * *"
   workflow_dispatch: {}      # allow manual "Run workflow" from the Actions tab
 
 # Never let two runs launch at once -> can't create duplicate instances.
@@ -24,7 +25,7 @@ permissions:
 jobs:
   hunt:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 350   # each run loops internally for ~5.5h (job max is 6h)
     env:
       # --- auth (from encrypted GitHub secrets) ---
       OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
@@ -41,6 +42,8 @@ jobs:
       MEM_GB: "24"
       INSTANCE_DISPLAY_NAME: "market-genie"
       ASSIGN_PUBLIC_IP: "true"
+      LOOP_MINUTES: "330"        # keep retrying within a single run for 5.5h
+      INTERVAL_SECONDS: "300"    # one attempt every 5 minutes inside the loop
       SSH_PUBKEY: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJJ5Z6epXkLl+BfrK8A0NAv3ibxG5hBF4SqbN7V6eWtj oci-arm-instance"
 
     steps:
