@@ -35,8 +35,8 @@ jobs:
       # Compartment defaults to the tenancy root; availability domain and image
       # are auto-detected live from your account by the script. Leave them unset.
       SHAPE: "VM.Standard.A1.Flex"
-      OCPUS: "2"
-      MEM_GB: "12"
+      OCPUS: "4"
+      MEM_GB: "24"
       INSTANCE_DISPLAY_NAME: "market-genie"
       ASSIGN_PUBLIC_IP: "true"
       SSH_PUBKEY: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJJ5Z6epXkLl+BfrK8A0NAv3ibxG5hBF4SqbN7V6eWtj oci-arm-instance"
