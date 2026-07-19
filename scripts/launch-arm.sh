@@ -9,18 +9,20 @@
 #   - if the launch succeeds                 -> reports "success" + public IP
 #   - on any real error (auth/config/quota)  -> exits 1 so CI alerts you
 #
-# Auth is taken from OCI_CLI_* environment variables (set from GitHub secrets).
-# All the non-secret config below is passed in via environment variables too.
+# Everything account-specific (compartment, availability domain, image) is
+# derived LIVE from the account behind the OCI_CLI_* credentials, so it always
+# matches the tenancy you authenticated as. Only the instance SSH public key
+# and the shape sizing are passed in.
 
 set -uo pipefail
 
-# ---- required config (env) -------------------------------------------------
-: "${COMPARTMENT_OCID:?set COMPARTMENT_OCID}"
-: "${AD:?set AD (availability domain)}"
-: "${IMAGE_OCID:?set IMAGE_OCID}"
-: "${SSH_PUBKEY:?set SSH_PUBKEY}"
+# ---- auth-derived / optional config (env) ---------------------------------
+: "${OCI_CLI_TENANCY:?OCI_CLI_TENANCY must be set (from secrets)}"
+: "${SSH_PUBKEY:?set SSH_PUBKEY (instance login public key)}"
 
-# ---- config with sane defaults --------------------------------------------
+# Compartment defaults to the tenancy root (correct for Always-Free).
+COMPARTMENT_OCID="${COMPARTMENT_OCID:-$OCI_CLI_TENANCY}"
+
 SHAPE="${SHAPE:-VM.Standard.A1.Flex}"
 OCPUS="${OCPUS:-2}"
 MEM_GB="${MEM_GB:-12}"
@@ -30,9 +32,11 @@ SUBNET_DISPLAY_NAME="${SUBNET_DISPLAY_NAME:-arm-hunter-subnet}"
 VCN_CIDR="${VCN_CIDR:-10.0.0.0/16}"
 SUBNET_CIDR="${SUBNET_CIDR:-10.0.0.0/24}"
 ASSIGN_PUBLIC_IP="${ASSIGN_PUBLIC_IP:-true}"
+# AD and IMAGE_OCID are auto-detected below if left blank.
+AD="${AD:-}"
+IMAGE_OCID="${IMAGE_OCID:-}"
 
 log()  { echo "[$(printf '%(%H:%M:%S)T' -1)] $*"; }
-# Emit a machine-readable result for the workflow to act on.
 emit() { if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "result=$1" >>"$GITHUB_OUTPUT"; fi; }
 
 # ---------------------------------------------------------------------------
@@ -51,7 +55,34 @@ if [ "${existing:-0}" -gt 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Ensure the network exists (find-or-create). Created once, reused forever.
+# 2. Discover availability domains and image (live, from THIS tenancy).
+# ---------------------------------------------------------------------------
+if [ -n "$AD" ]; then
+  ADS=("$AD")
+else
+  log "Detecting availability domains..."
+  mapfile -t ADS < <(oci iam availability-domain list -c "$COMPARTMENT_OCID" 2>/dev/null \
+    | jq -r '.data[].name')
+fi
+if [ "${#ADS[@]}" -eq 0 ] || [ -z "${ADS[0]:-}" ]; then
+  log "ERROR: could not list availability domains (check auth/region)."; emit error; exit 1
+fi
+log "Availability domains: ${ADS[*]}"
+
+if [ -z "$IMAGE_OCID" ]; then
+  log "Detecting latest Oracle Linux image for $SHAPE..."
+  IMAGE_OCID=$(oci compute image list -c "$COMPARTMENT_OCID" \
+    --operating-system "Oracle Linux" --shape "$SHAPE" \
+    --sort-by TIMECREATED --sort-order DESC \
+    --query 'data[0].id' --raw-output 2>/dev/null)
+fi
+if [ -z "$IMAGE_OCID" ] || [ "$IMAGE_OCID" = "null" ]; then
+  log "ERROR: could not find a compatible image for $SHAPE."; emit error; exit 1
+fi
+log "Using image: $IMAGE_OCID"
+
+# ---------------------------------------------------------------------------
+# 3. Ensure the network exists (find-or-create). Created once, reused forever.
 # ---------------------------------------------------------------------------
 log "Ensuring VCN '$VCN_DISPLAY_NAME' exists..."
 vcn_id=$(oci network vcn list -c "$COMPARTMENT_OCID" --display-name "$VCN_DISPLAY_NAME" \
@@ -86,46 +117,54 @@ if [ -z "${subnet_id}" ] || [ "${subnet_id}" = "null" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Attempt the launch.
+# 4. Attempt the launch, trying each availability domain in turn.
 # ---------------------------------------------------------------------------
-log "Attempting to launch $SHAPE ($OCPUS OCPU / ${MEM_GB}GB) in $AD ..."
-out=$(oci compute instance launch \
-  --compartment-id "$COMPARTMENT_OCID" \
-  --availability-domain "$AD" \
-  --shape "$SHAPE" \
-  --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEM_GB}" \
-  --image-id "$IMAGE_OCID" \
-  --subnet-id "$subnet_id" \
-  --assign-public-ip "$ASSIGN_PUBLIC_IP" \
-  --display-name "$INSTANCE_DISPLAY_NAME" \
-  --metadata "{\"ssh_authorized_keys\":\"$SSH_PUBKEY\"}" \
-  --wait-for-state RUNNING 2>&1)
-rc=$?
+saw_capacity_error=0
+for ad in "${ADS[@]}"; do
+  log "Attempting $SHAPE ($OCPUS OCPU / ${MEM_GB}GB) in $ad ..."
+  out=$(oci compute instance launch \
+    --compartment-id "$COMPARTMENT_OCID" \
+    --availability-domain "$ad" \
+    --shape "$SHAPE" \
+    --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEM_GB}" \
+    --image-id "$IMAGE_OCID" \
+    --subnet-id "$subnet_id" \
+    --assign-public-ip "$ASSIGN_PUBLIC_IP" \
+    --display-name "$INSTANCE_DISPLAY_NAME" \
+    --metadata "{\"ssh_authorized_keys\":\"$SSH_PUBKEY\"}" \
+    --wait-for-state RUNNING 2>&1)
+  rc=$?
 
-# ---------------------------------------------------------------------------
-# 4. Classify the outcome.
-# ---------------------------------------------------------------------------
-if [ $rc -eq 0 ]; then
-  instance_id=$(echo "$out" | jq -r '.data.id' 2>/dev/null)
-  public_ip=$(oci compute instance list-vnics --instance-id "$instance_id" \
-    --query 'data[0]."public-ip"' --raw-output 2>/dev/null || echo "n/a")
-  log "SUCCESS! Instance created: $instance_id"
-  log "Public IP: $public_ip"
-  echo "PUBLIC_IP=$public_ip" >>"${GITHUB_ENV:-/dev/null}"
-  emit success
-  exit 0
-fi
+  if [ $rc -eq 0 ]; then
+    instance_id=$(echo "$out" | jq -r '.data.id' 2>/dev/null)
+    public_ip=$(oci compute instance list-vnics --instance-id "$instance_id" \
+      --query 'data[0]."public-ip"' --raw-output 2>/dev/null || echo "n/a")
+    log "SUCCESS! Instance created in $ad: $instance_id"
+    log "Public IP: $public_ip"
+    echo "PUBLIC_IP=$public_ip" >>"${GITHUB_ENV:-/dev/null}"
+    emit success
+    exit 0
+  fi
 
-# Capacity errors are expected & normal — do not fail the job.
-if echo "$out" | grep -Eqi "Out of host capacity|InternalError|too many requests|LimitExceeded.*capacity|500"; then
-  log "No capacity right now (expected). Will retry next run."
-  log "OCI said: $(echo "$out" | tr '\n' ' ' | head -c 400)"
+  if echo "$out" | grep -Eqi "Out of host capacity|InternalError|too many requests|LimitExceeded.*capacity|500"; then
+    log "No capacity in $ad (expected). OCI said: $(echo "$out" | tr '\n' ' ' | head -c 300)"
+    saw_capacity_error=1
+    continue
+  fi
+
+  # Non-capacity error -> genuine problem, alert immediately.
+  log "ERROR: launch failed in $ad for a non-capacity reason:"
+  echo "$out" >&2
+  emit error
+  exit 1
+done
+
+if [ "$saw_capacity_error" -eq 1 ]; then
+  log "No capacity in any AD right now. Will retry next run."
   emit no_capacity
   exit 0
 fi
 
-# Anything else is a genuine problem worth alerting on.
-log "ERROR: launch failed for a non-capacity reason:"
-echo "$out" >&2
+log "ERROR: no launch attempt succeeded and no capacity error was seen."
 emit error
 exit 1

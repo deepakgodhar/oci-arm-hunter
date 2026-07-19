@@ -31,16 +31,15 @@ jobs:
       OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
       OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
 
-      # --- non-secret config (just identifiers; safe to be public) ---
-      COMPARTMENT_OCID: "ocid1.tenancy.oc1..aaaaaaaagizwbzjni26sugggo4khoud7j3xayofgefphqi2ls22cduc4weea"
-      AD: "qUCo:AP-MUMBAI-1-AD-1"
-      IMAGE_OCID: "ocid1.image.oc1.ap-mumbai-1.aaaaaaaalh3kwqptzhc64v73fv2zh5uw65ih54tnmfjaq2mlu3mo4me2dd5a"
+      # --- non-secret config ---
+      # Compartment defaults to the tenancy root; availability domain and image
+      # are auto-detected live from your account by the script. Leave them unset.
       SHAPE: "VM.Standard.A1.Flex"
       OCPUS: "2"
       MEM_GB: "12"
       INSTANCE_DISPLAY_NAME: "market-genie"
       ASSIGN_PUBLIC_IP: "true"
-      SSH_PUBKEY: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDZIchr0C3CJwK6sFvksfit13Q4cGG8SxrC00KONSl1HjT89Rl3q3jC8aH+nWNsfchBb5xbR0Vyd+0P2UGp/sOGA2aVP9CTmD657nI1oNxfbx6h7/+v2N2YRaLAXstv2QrBAozi9luFcJkwWTNnkTplDHEWoF4TSZJkVfT5M+i7Al+NG8FnJVgfYwpoS1y3AiXfLTBY6A3080BNvQaz47+THECDbbH5heLms0Q5g8O9BkENSZ43/ydPIPM4kqWmerxDpMdXOd24g3Wm/N2S/Vxdv7CI3ea9GrsfdO7yQ2pfcDWVkTuW9SvXueo1jJrW5SlW/drSjrLQqU8xNyJux7JB ssh-key-2026-06-14"
+      SSH_PUBKEY: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJJ5Z6epXkLl+BfrK8A0NAv3ibxG5hBF4SqbN7V6eWtj oci-arm-instance"
 
     steps:
       - uses: actions/checkout@v4
