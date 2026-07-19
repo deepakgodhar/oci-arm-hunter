@@ -1,0 +1,66 @@
+name: arm-hunter
+
+# Hunts for Always-Free Ampere A1 (ARM) capacity and creates the instance the
+# moment a slot frees up. Runs every 5 minutes until it succeeds, then disables
+# itself and opens an issue to notify you.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every ~5 min (GitHub's minimum granularity)
+  workflow_dispatch: {}      # allow manual "Run workflow" from the Actions tab
+
+# Never let two runs launch at once -> can't create duplicate instances.
+concurrency:
+  group: arm-hunter
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write     # to open the success notification issue
+  actions: write    # to disable this workflow once we win
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # --- auth (from encrypted GitHub secrets) ---
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+
+      # --- non-secret config (just identifiers; safe to be public) ---
+      COMPARTMENT_OCID: "ocid1.tenancy.oc1..aaaaaaaagizwbzjni26sugggo4khoud7j3xayofgefphqi2ls22cduc4weea"
+      AD: "qUCo:AP-MUMBAI-1-AD-1"
+      IMAGE_OCID: "ocid1.image.oc1.ap-mumbai-1.aaaaaaaalh3kwqptzhc64v73fv2zh5uw65ih54tnmfjaq2mlu3mo4me2dd5a"
+      SHAPE: "VM.Standard.A1.Flex"
+      OCPUS: "2"
+      MEM_GB: "12"
+      INSTANCE_DISPLAY_NAME: "market-genie"
+      ASSIGN_PUBLIC_IP: "true"
+      SSH_PUBKEY: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDZIchr0C3CJwK6sFvksfit13Q4cGG8SxrC00KONSl1HjT89Rl3q3jC8aH+nWNsfchBb5xbR0Vyd+0P2UGp/sOGA2aVP9CTmD657nI1oNxfbx6h7/+v2N2YRaLAXstv2QrBAozi9luFcJkwWTNnkTplDHEWoF4TSZJkVfT5M+i7Al+NG8FnJVgfYwpoS1y3AiXfLTBY6A3080BNvQaz47+THECDbbH5heLms0Q5g8O9BkENSZ43/ydPIPM4kqWmerxDpMdXOd24g3Wm/N2S/Vxdv7CI3ea9GrsfdO7yQ2pfcDWVkTuW9SvXueo1jJrW5SlW/drSjrLQqU8xNyJux7JB ssh-key-2026-06-14"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OCI CLI
+        run: |
+          pipx install oci-cli
+          oci --version
+
+      - name: Hunt for ARM capacity
+        id: hunt
+        run: bash scripts/launch-arm.sh
+
+      - name: Notify + stop on success
+        if: steps.hunt.outputs.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "🎉 Always-Free ARM instance is ready" \
+            --body "The A1.Flex instance is up. Public IP: ${PUBLIC_IP:-check OCI console}. This workflow has been disabled." \
+            || echo "issue create skipped"
+          gh workflow disable arm-hunter.yml || echo "disable skipped"
