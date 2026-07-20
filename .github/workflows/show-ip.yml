@@ -1,0 +1,51 @@
+name: show-ip
+
+# On-demand: print the market-genie instance's state and public IP.
+# Run it from the Actions tab (Run workflow) or: gh workflow run show-ip.yml
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  show:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+      INSTANCE_DISPLAY_NAME: "market-genie"
+    steps:
+      - name: Install OCI CLI
+        run: pipx install oci-cli
+
+      - name: Show instance IP
+        run: |
+          set -e
+          C="$OCI_CLI_TENANCY"
+          ID=$(oci compute instance list -c "$C" --display-name "$INSTANCE_DISPLAY_NAME" \
+                 --lifecycle-state RUNNING --query 'data[0].id' --raw-output)
+          if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+            echo "No RUNNING instance named $INSTANCE_DISPLAY_NAME found."; exit 1
+          fi
+          STATE=$(oci compute instance get --instance-id "$ID" --query 'data."lifecycle-state"' --raw-output)
+          PUB=$(oci compute instance list-vnics --instance-id "$ID" --query 'data[0]."public-ip"' --raw-output)
+          PRIV=$(oci compute instance list-vnics --instance-id "$ID" --query 'data[0]."private-ip"' --raw-output)
+          echo "======================================"
+          echo "Instance : $INSTANCE_DISPLAY_NAME"
+          echo "State    : $STATE"
+          echo "Public IP: $PUB"
+          echo "Private  : $PRIV"
+          echo "SSH      : ssh -i oci_instance_key opc@$PUB"
+          echo "======================================"
+          {
+            echo "### $INSTANCE_DISPLAY_NAME"
+            echo "- **State:** $STATE"
+            echo "- **Public IP:** \`$PUB\`"
+            echo "- **SSH:** \`ssh -i oci_instance_key opc@$PUB\`"
+          } >> "$GITHUB_STEP_SUMMARY"

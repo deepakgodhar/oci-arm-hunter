@@ -59,7 +59,10 @@ try_launch() {
     rc=$?
 
     if [ $rc -eq 0 ]; then
-      instance_id=$(echo "$out" | jq -r '.data.id' 2>/dev/null)
+      # Re-fetch by name; $out is polluted with --wait-for-state progress text.
+      instance_id=$(oci compute instance list -c "$COMPARTMENT_OCID" \
+        --display-name "$INSTANCE_DISPLAY_NAME" --lifecycle-state RUNNING \
+        --query 'data[0].id' --raw-output 2>/dev/null)
       PUBLIC_IP=$(oci compute instance list-vnics --instance-id "$instance_id" \
         --query 'data[0]."public-ip"' --raw-output 2>/dev/null || echo "n/a")
       log "SUCCESS! Instance created in $ad: $instance_id (public IP: $PUBLIC_IP)"
