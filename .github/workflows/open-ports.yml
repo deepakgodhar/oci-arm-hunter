@@ -1,0 +1,45 @@
+name: open-ports
+
+# One-off: open web ports (80/443) plus SSH (22) on the arm-hunter-vcn's
+# default security list. ICMP path-MTU rules are kept. Egress is left as-is.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  open:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+      VCN_DISPLAY_NAME: "arm-hunter-vcn"
+    steps:
+      - name: Install OCI CLI
+        run: pipx install oci-cli
+
+      - name: Open 22/80/443 on the security list
+        run: |
+          set -e
+          C="$OCI_CLI_TENANCY"
+          VCN=$(oci network vcn list -c "$C" --display-name "$VCN_DISPLAY_NAME" --query 'data[0].id' --raw-output)
+          SL=$(oci network vcn get --vcn-id "$VCN" --query 'data."default-security-list-id"' --raw-output)
+          echo "VCN=$VCN"; echo "SecurityList=$SL"
+          RULES='[
+            {"protocol":"6","source":"0.0.0.0/0","isStateless":false,"tcpOptions":{"destinationPortRange":{"min":22,"max":22}}},
+            {"protocol":"6","source":"0.0.0.0/0","isStateless":false,"tcpOptions":{"destinationPortRange":{"min":80,"max":80}}},
+            {"protocol":"6","source":"0.0.0.0/0","isStateless":false,"tcpOptions":{"destinationPortRange":{"min":443,"max":443}}},
+            {"protocol":"1","source":"0.0.0.0/0","isStateless":false,"icmpOptions":{"type":3,"code":4}},
+            {"protocol":"1","source":"10.0.0.0/16","isStateless":false,"icmpOptions":{"type":3}}
+          ]'
+          oci network security-list update --security-list-id "$SL" \
+            --ingress-security-rules "$RULES" --force >/dev/null
+          echo "Ingress rules now:"
+          oci network security-list get --security-list-id "$SL" \
+            --query 'data."ingress-security-rules"[].{proto:protocol,src:source,tcp:"tcp-options"}' --output table
