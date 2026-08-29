@@ -1,0 +1,57 @@
+name: diagnose
+
+# Read-only. Answers "what actually happened to the instance" when show-ip says
+# there is no RUNNING one - because that filter cannot distinguish STOPPED from
+# TERMINATED from never-existed, and those have completely different fixes.
+#
+# Lists every instance in every lifecycle state, then the boot volumes (a volume
+# outliving its instance means the data is still there and it can be relaunched),
+# then recent work requests, which is the only record of WHO terminated it and WHEN.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+    steps:
+      - name: Install OCI CLI
+        run: pipx install oci-cli
+
+      - name: Every instance, every state
+        run: |
+          set +e
+          C="$OCI_CLI_TENANCY"
+          echo "=== INSTANCES (all lifecycle states) ==="
+          oci compute instance list -c "$C" --all \
+            --query 'data[].{name:"display-name",state:"lifecycle-state",shape:shape,created:"time-created"}' \
+            --output table 2>&1 | head -40
+
+          echo
+          echo "=== BOOT VOLUMES (data survives a terminated instance if these remain) ==="
+          for AD in "qUCo:AP-MUMBAI-1-AD-1" "qUCo:AP-MUMBAI-1-AD-2" "qUCo:AP-MUMBAI-1-AD-3"; do
+            oci bv boot-volume list -c "$C" --availability-domain "$AD" \
+              --query 'data[].{name:"display-name",state:"lifecycle-state",gb:"size-in-gbs",created:"time-created"}' \
+              --output table 2>&1 | grep -v '^$' | head -12
+          done
+
+          echo
+          echo "=== RECENT WORK REQUESTS (who did what, and when) ==="
+          oci work-requests work-request list -c "$C" --all \
+            --query 'data[].{op:"operation-type",status:status,accepted:"time-accepted"}' \
+            --output table 2>&1 | head -30
+
+          echo
+          echo "=== ACCOUNT / TENANCY ==="
+          oci iam tenancy get --tenancy-id "$C" \
+            --query 'data.{name:name,home:"home-region-key"}' --output table 2>&1 | head -10
