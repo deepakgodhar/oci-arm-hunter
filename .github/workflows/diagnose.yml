@@ -32,6 +32,18 @@ jobs:
         run: |
           set +e
           C="$OCI_CLI_TENANCY"
+          AD=$(oci iam availability-domain list -c "$C" --query 'data[0].name' --raw-output)
+          echo "=== ACTUAL AVAILABILITY DOMAIN: $AD ==="
+          echo "(main.tf hardcodes qUCo:AP-MUMBAI-1-AD-1 - if that differs, the tenancy was recreated)"
+
+          echo
+          echo "=== A1 SERVICE LIMITS (the launch failed on these) ==="
+          for L in standard-a1-core-count standard-a1-memory-count; do
+            AV=$(oci limits value list -c "$C" --service-name compute --name "$L" --availability-domain "$AD" --query 'data[0].value' --raw-output 2>/dev/null)
+            USED=$(oci limits resource-availability get --service-name compute --limit-name "$L" -c "$C" --availability-domain "$AD" --query 'data."used"' --raw-output 2>/dev/null)
+            AVAIL=$(oci limits resource-availability get --service-name compute --limit-name "$L" -c "$C" --availability-domain "$AD" --query 'data."available"' --raw-output 2>/dev/null)
+            echo "  $L -> limit=$AV used=$USED available=$AVAIL"
+          done
           echo "=== INSTANCES (all lifecycle states) ==="
           oci compute instance list -c "$C" --all \
             --query 'data[].{name:"display-name",state:"lifecycle-state",shape:shape,created:"time-created"}' \
@@ -39,11 +51,9 @@ jobs:
 
           echo
           echo "=== BOOT VOLUMES (data survives a terminated instance if these remain) ==="
-          for AD in "qUCo:AP-MUMBAI-1-AD-1" "qUCo:AP-MUMBAI-1-AD-2" "qUCo:AP-MUMBAI-1-AD-3"; do
-            oci bv boot-volume list -c "$C" --availability-domain "$AD" \
-              --query 'data[].{name:"display-name",state:"lifecycle-state",gb:"size-in-gbs",created:"time-created"}' \
-              --output table 2>&1 | grep -v '^$' | head -12
-          done
+          oci bv boot-volume list -c "$C" --availability-domain "$AD" \
+            --query 'data[].{name:"display-name",state:"lifecycle-state",gb:"size-in-gbs",created:"time-created"}' \
+            --output table 2>&1 | head -14
 
           echo
           echo "=== RECENT WORK REQUESTS (who did what, and when) ==="
