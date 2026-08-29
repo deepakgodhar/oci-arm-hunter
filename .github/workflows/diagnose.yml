@@ -50,6 +50,18 @@ jobs:
             --output table 2>&1 | head -40
 
           echo
+          echo "=== BOOT-VOLUME REUSE PRE-FLIGHT (what launch-arm.sh will resolve) ==="
+          BV=$(oci bv boot-volume list -c "$C" --availability-domain "$AD" \
+            --query "data[?\"lifecycle-state\"=='AVAILABLE' && starts_with(\"display-name\", 'market-genie')]|[0].id" \
+            --raw-output 2>&1)
+          if [ -n "$BV" ] && [ "$BV" != "null" ]; then
+            echo "  RESOLVED -> $BV"
+            echo "  (the hunter will relaunch from this volume, keeping your data)"
+          else
+            echo "  EMPTY -> the hunter would build from a fresh image and orphan the old volume"
+          fi
+
+          echo
           echo "=== BOOT VOLUMES (data survives a terminated instance if these remain) ==="
           oci bv boot-volume list -c "$C" --availability-domain "$AD" \
             --query 'data[].{name:"display-name",state:"lifecycle-state",gb:"size-in-gbs",created:"time-created"}' \
