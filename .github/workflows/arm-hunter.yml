@@ -38,8 +38,12 @@ jobs:
       # Compartment defaults to the tenancy root; availability domain and image
       # are auto-detected live from your account by the script. Leave them unset.
       SHAPE: "VM.Standard.A1.Flex"
-      OCPUS: "4"
-      MEM_GB: "24"
+      # 2/12, not 4/24. The tenancy's A1 service limit reports
+      # standard-a1-core-count=2 and standard-a1-memory-count=12, so asking for
+      # 4/24 fails instantly with LimitExceeded - which is NOT a capacity error
+      # and so is not retryable. main.tf had 2/12 all along; only this file drifted.
+      OCPUS: "2"
+      MEM_GB: "12"
       INSTANCE_DISPLAY_NAME: "market-genie"
       ASSIGN_PUBLIC_IP: "true"
       LOOP_MINUTES: "330"        # keep retrying within a single run for 5.5h

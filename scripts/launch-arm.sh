@@ -19,8 +19,8 @@ set -uo pipefail
 
 COMPARTMENT_OCID="${COMPARTMENT_OCID:-$OCI_CLI_TENANCY}"
 SHAPE="${SHAPE:-VM.Standard.A1.Flex}"
-OCPUS="${OCPUS:-4}"
-MEM_GB="${MEM_GB:-24}"
+OCPUS="${OCPUS:-2}"
+MEM_GB="${MEM_GB:-12}"
 INSTANCE_DISPLAY_NAME="${INSTANCE_DISPLAY_NAME:-market-genie}"
 VCN_DISPLAY_NAME="${VCN_DISPLAY_NAME:-arm-hunter-vcn}"
 SUBNET_DISPLAY_NAME="${SUBNET_DISPLAY_NAME:-arm-hunter-subnet}"
@@ -41,22 +41,58 @@ emit() { if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "result=$1" >>"$GITHUB_OUTPUT
 # One launch attempt across all availability domains.
 #   returns 0 = created, 1 = fatal error, 2 = out of capacity (retry)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# A terminated instance can leave its boot volume behind, and Oracle's idle
+# reclamation does exactly that - market-genie was terminated but its 47GB volume
+# is still AVAILABLE. Relaunching from that volume restores the machine as it was:
+# same packages, same data, same authorized_keys. Building from a fresh image
+# instead would silently throw all of it away, which is the expensive mistake here.
+#
+# Prints the id of a detached, AVAILABLE boot volume for this instance, if any.
+# ---------------------------------------------------------------------------
+find_preserved_boot_volume() {
+  local ad="$1"
+  oci bv boot-volume list -c "$COMPARTMENT_OCID" --availability-domain "$ad" \
+    --query "data[?\"lifecycle-state\"=='AVAILABLE' && starts_with(\"display-name\", '$INSTANCE_DISPLAY_NAME')]|[0].id" \
+    --raw-output 2>/dev/null
+}
+
 try_launch() {
-  local ad out rc instance_id saw_capacity=0
+  local ad out rc instance_id saw_capacity=0 bv
   for ad in "${ADS[@]}"; do
-    log "Attempting $SHAPE ($OCPUS OCPU / ${MEM_GB}GB) in $ad ..."
-    out=$(oci compute instance launch \
-      --compartment-id "$COMPARTMENT_OCID" \
-      --availability-domain "$ad" \
-      --shape "$SHAPE" \
-      --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEM_GB}" \
-      --image-id "$IMAGE_OCID" \
-      --subnet-id "$SUBNET_ID" \
-      --assign-public-ip "$ASSIGN_PUBLIC_IP" \
-      --display-name "$INSTANCE_DISPLAY_NAME" \
-      --metadata "{\"ssh_authorized_keys\":\"$SSH_PUBKEY\"}" \
-      --wait-for-state RUNNING 2>&1)
-    rc=$?
+    bv=$(find_preserved_boot_volume "$ad")
+
+    if [ -n "$bv" ] && [ "$bv" != "null" ]; then
+      log "Found preserved boot volume - relaunching from it, not from a fresh image."
+      log "  $bv"
+      # No --image-id and no ssh metadata here: both come from the volume itself,
+      # and passing an image alongside a source volume is rejected outright.
+      out=$(oci compute instance launch \
+        --compartment-id "$COMPARTMENT_OCID" \
+        --availability-domain "$ad" \
+        --shape "$SHAPE" \
+        --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEM_GB}" \
+        --source-boot-volume-id "$bv" \
+        --subnet-id "$SUBNET_ID" \
+        --assign-public-ip "$ASSIGN_PUBLIC_IP" \
+        --display-name "$INSTANCE_DISPLAY_NAME" \
+        --wait-for-state RUNNING 2>&1)
+      rc=$?
+    else
+      log "Attempting $SHAPE ($OCPUS OCPU / ${MEM_GB}GB) in $ad ..."
+      out=$(oci compute instance launch \
+        --compartment-id "$COMPARTMENT_OCID" \
+        --availability-domain "$ad" \
+        --shape "$SHAPE" \
+        --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEM_GB}" \
+        --image-id "$IMAGE_OCID" \
+        --subnet-id "$SUBNET_ID" \
+        --assign-public-ip "$ASSIGN_PUBLIC_IP" \
+        --display-name "$INSTANCE_DISPLAY_NAME" \
+        --metadata "{\"ssh_authorized_keys\":\"$SSH_PUBKEY\"}" \
+        --wait-for-state RUNNING 2>&1)
+      rc=$?
+    fi
 
     if [ $rc -eq 0 ]; then
       # Re-fetch by name; $out is polluted with --wait-for-state progress text.
