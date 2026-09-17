@@ -39,7 +39,8 @@ emit() { if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "result=$1" >>"$GITHUB_OUTPUT
 
 # ---------------------------------------------------------------------------
 # One launch attempt across all availability domains.
-#   returns 0 = created, 1 = fatal error, 2 = out of capacity (retry)
+#   returns 0 = created, 1 = fatal error, 2 = no capacity OR a transient
+#   network/service blip - either way, worth another attempt (retry)
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # A terminated instance can leave its boot volume behind, and Oracle's idle
@@ -58,7 +59,7 @@ find_preserved_boot_volume() {
 }
 
 try_launch() {
-  local ad out rc instance_id saw_capacity=0 bv
+  local ad out rc instance_id retryable=0 bv
   for ad in "${ADS[@]}"; do
     bv=$(find_preserved_boot_volume "$ad")
 
@@ -105,9 +106,22 @@ try_launch() {
       return 0
     fi
 
-    if echo "$out" | grep -Eqi "Out of host capacity|InternalError|too many requests|LimitExceeded.*capacity|500"; then
+    # Oracle refuses in several dialects; InternalError is the one it actually
+    # uses for free-tier A1. All of them mean the same thing: come back later.
+    if echo "$out" | grep -Eqi "Out of host capacity|InternalError|too ?many ?requests|LimitExceeded.*capacity|500"; then
       log "No capacity in $ad. OCI said: $(echo "$out" | tr '\n' ' ' | head -c 200)"
-      saw_capacity=1
+      retryable=1
+      continue
+    fi
+
+    # Not a refusal at all - the request never reached a verdict. A dropped or
+    # timed-out connection says nothing about capacity, so aborting on one threw
+    # away the rest of the run's budget (hours of hunting) over a passing blip,
+    # and left no hunter running until the next cron.
+    if echo "$out" | grep -Eqi "RequestException|connection to endpoint timed out|ConnectTimeout|ReadTimeout|Connection aborted|Connection reset|Max retries exceeded|Temporary failure in name resolution|Service ?Unavailable|Bad ?Gateway|Gateway Time-?out"; then
+      log "Transient network/service error in $ad - no verdict on capacity, will retry."
+      log "  $(echo "$out" | tr '\n' ' ' | head -c 200)"
+      retryable=1
       continue
     fi
 
@@ -115,7 +129,7 @@ try_launch() {
     echo "$out" >&2
     return 1
   done
-  [ "$saw_capacity" -eq 1 ] && return 2
+  [ "$retryable" -eq 1 ] && return 2
   return 1
 }
 
