@@ -20,9 +20,9 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: "preflight = measure only, creates nothing. setup = clone + launch + attach. teardown = remove it all."
+        description: "preflight = measure only. setup = clone + launch + attach. reset-box = replace just the box, keep the clone. teardown = remove it all."
         type: choice
-        options: [preflight, setup, teardown]
+        options: [preflight, setup, reset-box, teardown]
         default: preflight
         required: true
 
@@ -70,7 +70,7 @@ jobs:
       # Creates nothing.
       # -------------------------------------------------------------------
       - name: Measure free-tier headroom
-        if: inputs.action != 'teardown'
+        if: inputs.action == 'preflight' || inputs.action == 'setup'
         run: |
           set -uo pipefail
           C="$OCI_CLI_TENANCY"
@@ -206,9 +206,20 @@ jobs:
           if [ -n "$ID" ] && [ "$ID" != "null" ]; then
             echo "Rescue box already running: $ID"
           else
-            IMG=$(oci compute image list -c "$C" --operating-system "Oracle Linux" \
-              --shape "$RESCUE_SHAPE" --sort-by TIMECREATED --sort-order DESC \
-              --query 'data[0].id' --raw-output)
+            # Pin the major version. Sorting all Oracle Linux images by creation
+            # date picked OL7.9, whose 5.4 kernel cannot mount the clone at all:
+            # "Superblock has unknown incompatible features (0x28)" - the volume
+            # is modern XFS (bigtime/inobtcount) and needs a 5.14+ kernel.
+            for V in 9 8; do
+              IMG=$(oci compute image list -c "$C" --operating-system "Oracle Linux" \
+                --operating-system-version "$V" --shape "$RESCUE_SHAPE" \
+                --sort-by TIMECREATED --sort-order DESC \
+                --query 'data[0].id' --raw-output 2>/dev/null)
+              [ -n "$IMG" ] && [ "$IMG" != "null" ] && { echo "Using Oracle Linux $V image."; break; }
+            done
+            if [ -z "$IMG" ] || [ "$IMG" = "null" ]; then
+              echo "FATAL: no Oracle Linux 8/9 image for $RESCUE_SHAPE." >&2; exit 1
+            fi
             echo "Launching $RESCUE_SHAPE (image $IMG)..."
             set +e
             OUT=$(oci compute instance launch \
@@ -284,6 +295,22 @@ jobs:
             echo "**Run this workflow with \`teardown\` once the data is off** — that releases"
             echo "the clone and the rescue box's boot volume back to the free allowance."
           } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Reset box only — keep the clone
+        if: inputs.action == 'reset-box'
+        run: |
+          set -uo pipefail
+          C="$OCI_CLI_TENANCY"
+          ID=$(oci compute instance list -c "$C" --display-name "$RESCUE_NAME" \
+                 --query "data[?\"lifecycle-state\"!='TERMINATED']|[0].id" --raw-output 2>/dev/null)
+          if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+            echo "Terminating just the rescue box ($ID); the clone stays."
+            oci compute instance terminate --instance-id "$ID" \
+              --no-preserve-boot-volume --force --wait-for-state TERMINATED
+            echo "Gone. Re-run with 'setup' to relaunch and re-attach the clone."
+          else
+            echo "No rescue box running. Re-run with 'setup'."
+          fi
 
       - name: Teardown
         if: inputs.action == 'teardown'
