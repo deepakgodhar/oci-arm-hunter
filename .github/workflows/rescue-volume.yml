@@ -1,0 +1,314 @@
+name: rescue-volume
+
+# Gets the data off market-genie's preserved boot volume WITHOUT waiting for A1
+# capacity. The free tier includes 2x VM.Standard.E2.1.Micro (AMD x86) from a
+# pool separate from Ampere, so a rescue box is obtainable even while the A1
+# hunt keeps coming back empty.
+#
+# It works on a CLONE of the boot volume, never the original, for two reasons:
+#   1. An attached volume cannot be launched from, so touching the original
+#      would block arm-hunter from ever winning while the rescue box is up.
+#   2. Mounting XFS with a dirty log replays the journal and writes to the
+#      filesystem even under -o ro. The original is the only copy; don't mount it.
+#
+# COST: everything here is meant to stay inside Always Free. That is not
+# assumed - `preflight` measures the tenancy's real block-storage headroom and
+# `setup` refuses to create anything if the numbers don't fit. Run preflight
+# first, read the arithmetic, then run setup.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "preflight = measure only, creates nothing. setup = clone + launch + attach. teardown = remove it all."
+        type: choice
+        options: [preflight, setup, teardown]
+        default: preflight
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rescue-volume
+  cancel-in-progress: false
+
+jobs:
+  rescue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+
+      # The volume we are rescuing. Must match what launch-arm.sh looks for.
+      SOURCE_NAME: "market-genie"
+      # Deliberately does NOT start with "market-genie": launch-arm.sh resolves
+      # its relaunch target by that prefix and would otherwise pick the clone.
+      CLONE_NAME: "rescue-clone"
+      RESCUE_NAME: "rescue-box"
+      RESCUE_SHAPE: "VM.Standard.E2.1.Micro"
+      VCN_DISPLAY_NAME: "arm-hunter-vcn"
+      SUBNET_DISPLAY_NAME: "arm-hunter-subnet"
+      # Always Free ceiling for boot + block volumes combined, in GB.
+      FREE_STORAGE_GB: "200"
+      # Oracle Linux needs 50GB minimum for the rescue box's own boot volume.
+      RESCUE_BOOT_GB: "50"
+      # Same key the hunter injects, so oci_instance_key opens this box too.
+      SSH_PUBKEY: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJJ5Z6epXkLl+BfrK8A0NAv3ibxG5hBF4SqbN7V6eWtj oci-arm-instance"
+
+    steps:
+      - name: Install OCI CLI
+        run: pipx install oci-cli
+
+      # -------------------------------------------------------------------
+      # Shared cost guard. Writes CLONE_GB / HEADROOM / VERDICT to the env so
+      # both preflight and setup read the same numbers from the same code.
+      # Creates nothing.
+      # -------------------------------------------------------------------
+      - name: Measure free-tier headroom
+        if: inputs.action != 'teardown'
+        run: |
+          set -uo pipefail
+          C="$OCI_CLI_TENANCY"
+          AD=$(oci iam availability-domain list -c "$C" --query 'data[0].name' --raw-output)
+          echo "AD=$AD" >>"$GITHUB_ENV"
+          echo "Region: $OCI_CLI_REGION   AD: $AD"
+          echo
+
+          echo "=== EVERY VOLUME THAT COUNTS AGAINST THE 200GB ==="
+          oci bv boot-volume list -c "$C" --availability-domain "$AD" \
+            --query "data[?\"lifecycle-state\"!='TERMINATED'].{name:\"display-name\",gb:\"size-in-gbs\",vpus:\"vpus-per-gb\",state:\"lifecycle-state\"}" \
+            --output table 2>&1 | head -20
+          oci bv volume list -c "$C" --availability-domain "$AD" \
+            --query "data[?\"lifecycle-state\"!='TERMINATED'].{name:\"display-name\",gb:\"size-in-gbs\",vpus:\"vpus-per-gb\",state:\"lifecycle-state\"}" \
+            --output table 2>&1 | head -20
+
+          BOOT_GB=$(oci bv boot-volume list -c "$C" --availability-domain "$AD" \
+            --query "sum(data[?\"lifecycle-state\"!='TERMINATED'].\"size-in-gbs\")" --raw-output 2>/dev/null || echo 0)
+          BLK_GB=$(oci bv volume list -c "$C" --availability-domain "$AD" \
+            --query "sum(data[?\"lifecycle-state\"!='TERMINATED'].\"size-in-gbs\")" --raw-output 2>/dev/null || echo 0)
+          BOOT_GB=${BOOT_GB:-0}; BLK_GB=${BLK_GB:-0}
+          BOOT_GB=${BOOT_GB%.*}; BLK_GB=${BLK_GB%.*}
+          USED=$(( BOOT_GB + BLK_GB ))
+
+          CLONE_GB=$(oci bv boot-volume list -c "$C" --availability-domain "$AD" \
+            --query "data[?\"lifecycle-state\"=='AVAILABLE' && starts_with(\"display-name\", '$SOURCE_NAME')]|[0].\"size-in-gbs\"" \
+            --raw-output 2>/dev/null)
+          CLONE_GB=${CLONE_GB:-0}; CLONE_GB=${CLONE_GB%.*}
+          if [ "$CLONE_GB" -eq 0 ]; then
+            echo "FATAL: no AVAILABLE boot volume named $SOURCE_NAME*. Nothing to rescue." >&2
+            exit 1
+          fi
+
+          # A clone that already exists is already counted in USED.
+          EXISTING=$(oci bv boot-volume list -c "$C" --availability-domain "$AD" \
+            --query "data[?\"lifecycle-state\"=='AVAILABLE' && \"display-name\"=='$CLONE_NAME']|[0].id" --raw-output 2>/dev/null)
+          ADD_CLONE="$CLONE_GB"
+          [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ] && ADD_CLONE=0
+
+          # A rescue box that already runs already counts its boot volume too.
+          RUNNING=$(oci compute instance list -c "$C" --display-name "$RESCUE_NAME" \
+            --query "data[?\"lifecycle-state\"=='RUNNING']|[0].id" --raw-output 2>/dev/null)
+          ADD_BOOT="$RESCUE_BOOT_GB"
+          [ -n "$RUNNING" ] && [ "$RUNNING" != "null" ] && ADD_BOOT=0
+
+          NEED=$(( USED + ADD_CLONE + ADD_BOOT ))
+          echo
+          echo "=== COST ARITHMETIC (Always Free ceiling: ${FREE_STORAGE_GB}GB) ==="
+          echo "  already provisioned      : ${USED}GB  (boot ${BOOT_GB} + block ${BLK_GB})"
+          echo "  + clone of $SOURCE_NAME  : ${ADD_CLONE}GB"
+          echo "  + rescue box boot volume : ${ADD_BOOT}GB"
+          echo "  --------------------------------------"
+          echo "  total after setup        : ${NEED}GB of ${FREE_STORAGE_GB}GB"
+          echo
+
+          echo "=== ALWAYS-FREE MICRO CAPACITY ==="
+          for L in standard-e2-micro-core-count; do
+            LIM=$(oci limits value list -c "$C" --service-name compute --name "$L" \
+                    --availability-domain "$AD" --query 'data[0].value' --raw-output 2>/dev/null)
+            AVA=$(oci limits resource-availability get --service-name compute --limit-name "$L" \
+                    -c "$C" --availability-domain "$AD" --query 'data."available"' --raw-output 2>/dev/null)
+            echo "  $L -> limit=${LIM:-?} available=${AVA:-?}"
+          done
+
+          echo
+          if [ "$NEED" -gt "${FREE_STORAGE_GB}" ]; then
+            echo "VERDICT: WOULD EXCEED FREE TIER by $(( NEED - FREE_STORAGE_GB ))GB - setup will refuse."
+            echo "VERDICT=over" >>"$GITHUB_ENV"
+          else
+            echo "VERDICT: fits, with $(( FREE_STORAGE_GB - NEED ))GB to spare."
+            echo "VERDICT=ok" >>"$GITHUB_ENV"
+          fi
+          echo "CLONE_GB=$CLONE_GB" >>"$GITHUB_ENV"
+
+      - name: Preflight summary
+        if: inputs.action == 'preflight'
+        run: |
+          {
+            echo "## Preflight — nothing was created"
+            echo ""
+            echo "Verdict: **$VERDICT**. Clone would be **${CLONE_GB}GB**."
+            echo ""
+            echo "Re-run with \`setup\` if the arithmetic above looks right."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup — clone, launch, attach
+        if: inputs.action == 'setup'
+        run: |
+          set -euo pipefail
+          C="$OCI_CLI_TENANCY"
+
+          if [ "${VERDICT:-over}" != "ok" ]; then
+            echo "REFUSING: the cost guard says this would leave Always Free. Nothing created." >&2
+            exit 1
+          fi
+
+          SRC=$(oci bv boot-volume list -c "$C" --availability-domain "$AD" \
+            --query "data[?\"lifecycle-state\"=='AVAILABLE' && starts_with(\"display-name\", '$SOURCE_NAME')]|[0].id" \
+            --raw-output)
+          echo "Source volume: $SRC"
+
+          # --- clone (reuse one from a prior run if present) ------------------
+          CLONE=$(oci bv boot-volume list -c "$C" --availability-domain "$AD" \
+            --query "data[?\"lifecycle-state\"=='AVAILABLE' && \"display-name\"=='$CLONE_NAME']|[0].id" \
+            --raw-output 2>/dev/null || true)
+          if [ -n "$CLONE" ] && [ "$CLONE" != "null" ]; then
+            echo "Reusing existing clone: $CLONE"
+          else
+            # vpus-per-gb 0 = Lower Cost tier. Plenty for a one-off copy, and on
+            # a PAYG account it is the cheapest possible setting rather than the
+            # billable Balanced default.
+            echo "Cloning at 0 VPUs/GB (Lower Cost)..."
+            CLONE=$(oci bv boot-volume create --source-boot-volume-id "$SRC" \
+              --compartment-id "$C" --display-name "$CLONE_NAME" --vpus-per-gb 0 \
+              --wait-for-state AVAILABLE --query 'data.id' --raw-output)
+            echo "Clone: $CLONE"
+          fi
+
+          # --- network: reuse the hunter's VCN (22 already open on it) --------
+          VCN=$(oci network vcn list -c "$C" --display-name "$VCN_DISPLAY_NAME" --query 'data[0].id' --raw-output)
+          SUBNET=$(oci network subnet list -c "$C" --vcn-id "$VCN" \
+            --display-name "$SUBNET_DISPLAY_NAME" --query 'data[0].id' --raw-output)
+          if [ -z "$SUBNET" ] || [ "$SUBNET" = "null" ]; then
+            echo "FATAL: subnet $SUBNET_DISPLAY_NAME not found; run the hunter once to create the network." >&2
+            exit 1
+          fi
+
+          # --- rescue box: x86 Oracle Linux on the free micro shape -----------
+          ID=$(oci compute instance list -c "$C" --display-name "$RESCUE_NAME" \
+                 --query "data[?\"lifecycle-state\"=='RUNNING']|[0].id" --raw-output 2>/dev/null || true)
+          if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+            echo "Rescue box already running: $ID"
+          else
+            IMG=$(oci compute image list -c "$C" --operating-system "Oracle Linux" \
+              --shape "$RESCUE_SHAPE" --sort-by TIMECREATED --sort-order DESC \
+              --query 'data[0].id' --raw-output)
+            echo "Launching $RESCUE_SHAPE (image $IMG)..."
+            set +e
+            OUT=$(oci compute instance launch \
+              --compartment-id "$C" --availability-domain "$AD" \
+              --shape "$RESCUE_SHAPE" --image-id "$IMG" --subnet-id "$SUBNET" \
+              --boot-volume-size-in-gbs "$RESCUE_BOOT_GB" \
+              --assign-public-ip true --display-name "$RESCUE_NAME" \
+              --metadata "{\"ssh_authorized_keys\":\"$SSH_PUBKEY\"}" \
+              --wait-for-state RUNNING 2>&1)
+            RC=$?
+            set -e
+            if [ $RC -ne 0 ]; then
+              echo "Launch failed:" >&2; echo "$OUT" | head -30 >&2
+              echo "$OUT" | grep -qi "Out of host capacity" && \
+                echo "E2.1.Micro is out of capacity too - re-run later. Clone is kept." >&2
+              exit 1
+            fi
+            ID=$(oci compute instance list -c "$C" --display-name "$RESCUE_NAME" \
+                   --lifecycle-state RUNNING --query 'data[0].id' --raw-output)
+          fi
+          echo "Rescue box: $ID"
+
+          # --- attach the clone as a DATA volume ------------------------------
+          ATTACHED=$(oci compute volume-attachment list -c "$C" --instance-id "$ID" \
+            --query "data[?\"lifecycle-state\"=='ATTACHED' && \"volume-id\"=='$CLONE']|[0].id" \
+            --raw-output 2>/dev/null || true)
+          if [ -n "$ATTACHED" ] && [ "$ATTACHED" != "null" ]; then
+            echo "Clone already attached."
+          else
+            echo "Attaching clone (paravirtualized)..."
+            if ! oci compute volume-attachment attach --instance-id "$ID" --volume-id "$CLONE" \
+                 --type paravirtualized --wait-for-state ATTACHED >/dev/null 2>&1; then
+              echo "Paravirtualized attach rejected; falling back to iSCSI..."
+              oci compute volume-attachment attach --instance-id "$ID" --volume-id "$CLONE" \
+                --type iscsi --wait-for-state ATTACHED >/dev/null
+              echo "NOTE: iSCSI needs 'sudo oci-iscsi-config attach --all' on the box first."
+            fi
+          fi
+
+          PUB=$(oci compute instance list-vnics --instance-id "$ID" --query 'data[0]."public-ip"' --raw-output)
+
+          {
+            echo "## Rescue box ready"
+            echo ""
+            echo '```'
+            echo "ssh -i oci_instance_key opc@$PUB"
+            echo '```'
+            echo ""
+            echo "Then, on the box:"
+            echo ""
+            echo '```bash'
+            echo "lsblk                                  # clone should appear as sdb"
+            echo ""
+            echo "# Oracle Linux roots live in LVM and BOTH disks use the VG name"
+            echo "# 'ocivolume', so the clone's copy must be renamed before it can"
+            echo "# be activated. vgimportclone does exactly that."
+            echo "sudo vgimportclone --basevgname rescuevg /dev/sdb3"
+            echo "sudo vgchange -ay rescuevg"
+            echo "sudo lvs"
+            echo ""
+            echo "# nouuid is required: the clone's XFS UUID collides with the live root."
+            echo "sudo mkdir -p /mnt/genie"
+            echo "sudo mount -o ro,nouuid /dev/rescuevg/root /mnt/genie"
+            echo ""
+            echo "# find the app and its Postgres:"
+            echo "sudo ls /mnt/genie/var/lib/pgsql /mnt/genie/var/lib/postgresql 2>/dev/null"
+            echo "sudo ls /mnt/genie/opt /mnt/genie/srv /mnt/genie/home/opc"
+            echo "sudo cat /mnt/genie/etc/systemd/system/*.service 2>/dev/null | head -60"
+            echo '```'
+            echo ""
+            echo "Public IP: \`$PUB\` · Instance: \`$ID\` · Clone: \`$CLONE\` (${CLONE_GB}GB)"
+            echo ""
+            echo "**Run this workflow with \`teardown\` once the data is off** — that releases"
+            echo "the clone and the rescue box's boot volume back to the free allowance."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Teardown
+        if: inputs.action == 'teardown'
+        run: |
+          set -uo pipefail
+          C="$OCI_CLI_TENANCY"
+          AD=$(oci iam availability-domain list -c "$C" --query 'data[0].name' --raw-output)
+
+          ID=$(oci compute instance list -c "$C" --display-name "$RESCUE_NAME" \
+                 --query "data[?\"lifecycle-state\"!='TERMINATED']|[0].id" --raw-output 2>/dev/null)
+          if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+            echo "Terminating $RESCUE_NAME ($ID) and its boot volume..."
+            oci compute instance terminate --instance-id "$ID" \
+              --no-preserve-boot-volume --force --wait-for-state TERMINATED
+          else
+            echo "No rescue box to terminate."
+          fi
+
+          CL=$(oci bv boot-volume list -c "$C" --availability-domain "$AD" \
+                 --query "data[?\"lifecycle-state\"=='AVAILABLE' && \"display-name\"=='$CLONE_NAME']|[0].id" \
+                 --raw-output 2>/dev/null)
+          if [ -n "$CL" ] && [ "$CL" != "null" ]; then
+            echo "Deleting clone $CL ..."
+            oci bv boot-volume delete --boot-volume-id "$CL" --force --wait-for-state TERMINATED
+          else
+            echo "No clone to delete."
+          fi
+
+          echo
+          echo "Teardown complete. The original $SOURCE_NAME volume was never touched."
