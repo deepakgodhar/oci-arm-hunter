@@ -306,7 +306,7 @@ jobs:
           if [ -n "$ID" ] && [ "$ID" != "null" ]; then
             echo "Terminating just the rescue box ($ID); the clone stays."
             oci compute instance terminate --instance-id "$ID" \
-              --no-preserve-boot-volume --force --wait-for-state TERMINATED
+              --preserve-boot-volume false --force --wait-for-state TERMINATED
             echo "Gone. Re-run with 'setup' to relaunch and re-attach the clone."
           else
             echo "No rescue box running. Re-run with 'setup'."
@@ -324,7 +324,7 @@ jobs:
           if [ -n "$ID" ] && [ "$ID" != "null" ]; then
             echo "Terminating $RESCUE_NAME ($ID) and its boot volume..."
             oci compute instance terminate --instance-id "$ID" \
-              --no-preserve-boot-volume --force --wait-for-state TERMINATED
+              --preserve-boot-volume false --force --wait-for-state TERMINATED
           else
             echo "No rescue box to terminate."
           fi
