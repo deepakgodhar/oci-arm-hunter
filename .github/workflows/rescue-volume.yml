@@ -242,6 +242,29 @@ jobs:
           fi
           echo "Rescue box: $ID"
 
+          PUB=$(oci compute instance list-vnics --instance-id "$ID" --query 'data[0]."public-ip"' --raw-output)
+          echo "Public IP: $PUB"
+
+          # --- wait for the OS to finish booting BEFORE attaching -------------
+          # OCI reports RUNNING when the hypervisor starts the VM, not when Linux
+          # is up. Attaching during early boot is fatal here: the clone is itself
+          # a bootable Oracle Linux disk whose volume group is also named
+          # "ocivolume", so dracut sees two VGs of the same name, cannot resolve
+          # root, and loops in initqueue forever - the box never opens port 22.
+          # Attaching after boot leaves the running root already active, and the
+          # clone's VG is then renamed at mount time with vgimportclone.
+          echo "Waiting for sshd before attaching..."
+          UP=0
+          for i in $(seq 1 60); do
+            if timeout 4 bash -c "</dev/tcp/$PUB/22" 2>/dev/null; then UP=1; echo "  sshd up after ~$((i*10))s"; break; fi
+            sleep 10
+          done
+          if [ "$UP" -ne 1 ]; then
+            echo "FATAL: box never opened port 22; not attaching (that would strand it mid-boot)." >&2
+            echo "Run this workflow with 'status' for the serial console." >&2
+            exit 1
+          fi
+
           # --- attach the clone as a DATA volume ------------------------------
           ATTACHED=$(oci compute volume-attachment list -c "$C" --instance-id "$ID" \
             --query "data[?\"lifecycle-state\"=='ATTACHED' && \"volume-id\"=='$CLONE']|[0].id" \
@@ -258,8 +281,6 @@ jobs:
               echo "NOTE: iSCSI needs 'sudo oci-iscsi-config attach --all' on the box first."
             fi
           fi
-
-          PUB=$(oci compute instance list-vnics --instance-id "$ID" --query 'data[0]."public-ip"' --raw-output)
 
           {
             echo "## Rescue box ready"
