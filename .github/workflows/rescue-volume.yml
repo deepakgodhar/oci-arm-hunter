@@ -304,9 +304,11 @@ jobs:
           ID=$(oci compute instance list -c "$C" --display-name "$RESCUE_NAME" \
                  --query "data[?\"lifecycle-state\"!='TERMINATED']|[0].id" --raw-output 2>/dev/null)
           if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+            # terminate waits on a WORK REQUEST, so the state is SUCCEEDED -
+            # passing TERMINATED is rejected outright by the CLI.
             echo "Terminating just the rescue box ($ID); the clone stays."
             oci compute instance terminate --instance-id "$ID" \
-              --preserve-boot-volume false --force --wait-for-state TERMINATED
+              --preserve-boot-volume false --force --wait-for-state SUCCEEDED
             echo "Gone. Re-run with 'setup' to relaunch and re-attach the clone."
           else
             echo "No rescue box running. Re-run with 'setup'."
@@ -324,7 +326,7 @@ jobs:
           if [ -n "$ID" ] && [ "$ID" != "null" ]; then
             echo "Terminating $RESCUE_NAME ($ID) and its boot volume..."
             oci compute instance terminate --instance-id "$ID" \
-              --preserve-boot-volume false --force --wait-for-state TERMINATED
+              --preserve-boot-volume false --force --wait-for-state SUCCEEDED
           else
             echo "No rescue box to terminate."
           fi
