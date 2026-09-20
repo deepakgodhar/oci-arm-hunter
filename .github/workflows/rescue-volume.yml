@@ -20,9 +20,9 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: "preflight = measure only. setup = clone + launch + attach. reset-box = replace just the box, keep the clone. teardown = remove it all."
+        description: "preflight = measure only. setup = clone + launch + attach. status = state, IP and serial console. reset-box = replace just the box, keep the clone. teardown = remove it all."
         type: choice
-        options: [preflight, setup, reset-box, teardown]
+        options: [preflight, setup, status, reset-box, teardown]
         default: preflight
         required: true
 
@@ -295,6 +295,34 @@ jobs:
             echo "**Run this workflow with \`teardown\` once the data is off** — that releases"
             echo "the clone and the rescue box's boot volume back to the free allowance."
           } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Status — state, IP, serial console
+        if: inputs.action == 'status'
+        run: |
+          set -uo pipefail
+          C="$OCI_CLI_TENANCY"
+          ID=$(oci compute instance list -c "$C" --display-name "$RESCUE_NAME" \
+                 --query "data[?\"lifecycle-state\"!='TERMINATED']|[0].id" --raw-output 2>/dev/null)
+          if [ -z "$ID" ] || [ "$ID" = "null" ]; then echo "No rescue box exists."; exit 0; fi
+
+          oci compute instance get --instance-id "$ID" \
+            --query 'data.{name:"display-name",state:"lifecycle-state",shape:shape,created:"time-created"}' --output table
+          echo "Public IP: $(oci compute instance list-vnics --instance-id "$ID" --query 'data[0]."public-ip"' --raw-output 2>/dev/null)"
+          echo
+          echo "=== VOLUME ATTACHMENTS ==="
+          oci compute volume-attachment list -c "$C" --instance-id "$ID" \
+            --query 'data[].{state:"lifecycle-state",type:"attachment-type",vol:"volume-id"}' --output table 2>&1 | head
+
+          echo
+          echo "=== SERIAL CONSOLE (why it will not boot) ==="
+          CH=$(oci compute console-history capture --instance-id "$ID" \
+                 --query 'data.id' --raw-output --wait-for-state SUCCEEDED 2>/dev/null)
+          if [ -n "$CH" ] && [ "$CH" != "null" ]; then
+            oci compute console-history get-content --instance-console-history-id "$CH" \
+              --file - --length 60000 2>/dev/null | tail -60
+          else
+            echo "(console capture unavailable)"
+          fi
 
       - name: Reset box only — keep the clone
         if: inputs.action == 'reset-box'
