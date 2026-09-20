@@ -179,12 +179,14 @@ jobs:
           if [ -n "$CLONE" ] && [ "$CLONE" != "null" ]; then
             echo "Reusing existing clone: $CLONE"
           else
-            # vpus-per-gb 0 = Lower Cost tier. Plenty for a one-off copy, and on
-            # a PAYG account it is the cheapest possible setting rather than the
-            # billable Balanced default.
-            echo "Cloning at 0 VPUs/GB (Lower Cost)..."
+            # No --vpus-per-gb: the clone inherits the source's setting. The
+            # Lower Cost tier (0) is block-volume only and boot volumes reject
+            # it outright ("vpusPerGB is invalid"). Inheriting gives the clone
+            # the same 10 VPUs/GB the free tier already granted the original,
+            # so it carries identical cost characteristics - not new ones.
+            echo "Cloning (inherits source VPUs/GB)..."
             CLONE=$(oci bv boot-volume create --source-boot-volume-id "$SRC" \
-              --compartment-id "$C" --display-name "$CLONE_NAME" --vpus-per-gb 0 \
+              --compartment-id "$C" --display-name "$CLONE_NAME" \
               --wait-for-state AVAILABLE --query 'data.id' --raw-output)
             echo "Clone: $CLONE"
           fi
