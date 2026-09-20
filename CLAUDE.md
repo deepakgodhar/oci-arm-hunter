@@ -138,12 +138,14 @@ not 4/24 — it is not a restriction specific to this tenancy.
 
 ## Open items
 
-- **Cron URLs are wrong.** Both workflows in `deepakgodhar/Project-Tracker`
-  still ping `project-tracker-alpha-three.vercel.app`, so follow-up alerts and
-  the daily digest have been running against the abandoned Neon database since
-  the July migration. They need to point at the new domain. `CRON_SECRET` is
-  already an Actions secret there and matches what's deployed.
-- **Teardown not yet run.** The rescue box and clone are still up.
+- **Watch for the first unattended cron run** on the new URL. Both workflows in
+  `deepakgodhar/Project-Tracker` were repointed at
+  `clienttracker.someoneelses.cloud` (they had been hitting the abandoned Neon
+  database via Vercel since July). Manual runs of both pass; a *scheduled* one
+  had not yet been observed at the time of writing.
+  `CRON_SECRET` in that repo was **rotated during the July migration and never
+  updated**, so the URL fix alone returned 401 — the Actions secret was reset to
+  match the deployed value. If the app is ever moved again, check both.
 - **The hunt** continues. The goal is a *second* machine alongside a paid
   Hostinger VPS, for side projects, at no cost — so PAYG was considered and
   declined, and the 1 GB x86 micros are too small to be useful here.
