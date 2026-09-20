@@ -44,6 +44,10 @@ jobs:
       # and so is not retryable. main.tf had 2/12 all along; only this file drifted.
       OCPUS: "2"
       MEM_GB: "12"
+      # Try the full allowance, then half. A host with one spare core refuses
+      # 2/12 but takes 1/6, so asking only for the maximum turns down slots we
+      # would gladly have. Two 1-OCPU instances fit the same allowance anyway.
+      SHAPE_LADDER: "2/12,1/6"
       INSTANCE_DISPLAY_NAME: "market-genie"
       ASSIGN_PUBLIC_IP: "true"
       LOOP_MINUTES: "330"        # keep retrying within a single run for 5.5h
@@ -67,8 +71,30 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Built with echo into a file rather than inlined: a multi-line --body
+          # inside a YAML block scalar has to carry the block's indentation, and
+          # markdown would then render the whole thing as a code block.
+          {
+            echo "The A1.Flex instance is up."
+            echo
+            echo "- **Size:** ${WON_SHAPE:-unknown}"
+            echo "- **Public IP:** ${PUBLIC_IP:-check OCI console}"
+            echo "- **SSH:** \`ssh -i oci_instance_key opc@${PUBLIC_IP}\`"
+            echo
+            echo "This workflow has been disabled."
+            echo
+            if [ "${SPARE_OCPUS:-0}" -gt 0 ] 2>/dev/null; then
+              echo "**${SPARE_OCPUS} OCPU of the allowance is still unused.** To chase a"
+              echo "second instance with the remainder, set \`INSTANCE_DISPLAY_NAME\` to a"
+              echo "new name and \`SHAPE_LADDER\` to the leftover size, then re-enable this"
+              echo "workflow."
+              echo
+            fi
+            echo "Heads up: Oracle reclaims an Always Free instance whose 95th-percentile"
+            echo "CPU stays under 20% for 7 days. That is how the last one was lost."
+          } > /tmp/issue-body.md
           gh issue create \
-            --title "🎉 Always-Free ARM instance is ready" \
-            --body "The A1.Flex instance is up. Public IP: ${PUBLIC_IP:-check OCI console}. This workflow has been disabled." \
+            --title "🎉 Always-Free ARM instance is ready (${WON_SHAPE:-A1})" \
+            --body-file /tmp/issue-body.md \
             || echo "issue create skipped"
           gh workflow disable arm-hunter.yml || echo "disable skipped"

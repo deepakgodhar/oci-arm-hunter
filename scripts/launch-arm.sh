@@ -21,6 +21,11 @@ COMPARTMENT_OCID="${COMPARTMENT_OCID:-$OCI_CLI_TENANCY}"
 SHAPE="${SHAPE:-VM.Standard.A1.Flex}"
 OCPUS="${OCPUS:-2}"
 MEM_GB="${MEM_GB:-12}"
+# Sizes to try per attempt, largest first, as "ocpus/memGB". A host with one
+# spare core can satisfy 1/6 but refuses 2/12, so asking only for the full
+# allowance declines slots we would happily take. Half a machine beats none,
+# and two 1-OCPU instances fit the same 2 OCPU / 12 GB allowance as one 2-OCPU.
+SHAPE_LADDER="${SHAPE_LADDER:-${OCPUS}/${MEM_GB},1/6}"
 INSTANCE_DISPLAY_NAME="${INSTANCE_DISPLAY_NAME:-market-genie}"
 VCN_DISPLAY_NAME="${VCN_DISPLAY_NAME:-arm-hunter-vcn}"
 SUBNET_DISPLAY_NAME="${SUBNET_DISPLAY_NAME:-arm-hunter-subnet}"
@@ -33,6 +38,9 @@ LOOP_MINUTES="${LOOP_MINUTES:-0}"         # 0 = single attempt; >0 = loop
 INTERVAL_SECONDS="${INTERVAL_SECONDS:-300}"
 
 PUBLIC_IP="n/a"
+WON_OCPUS=""; WON_MEM=""
+
+IFS=',' read -r -a LADDER <<<"$SHAPE_LADDER"
 
 log()  { echo "[$(printf '%(%H:%M:%S)T' -1)] $*"; }
 emit() { if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "result=$1" >>"$GITHUB_OUTPUT"; fi; }
@@ -59,20 +67,21 @@ find_preserved_boot_volume() {
 }
 
 try_launch() {
-  local ad out rc instance_id retryable=0 bv
+  local ad out rc instance_id retryable=0 bv spec ocpus mem
   for ad in "${ADS[@]}"; do
-    bv=$(find_preserved_boot_volume "$ad")
+   bv=$(find_preserved_boot_volume "$ad")
+   for spec in "${LADDER[@]}"; do
+    ocpus="${spec%%/*}"; mem="${spec##*/}"
 
     if [ -n "$bv" ] && [ "$bv" != "null" ]; then
-      log "Found preserved boot volume - relaunching from it, not from a fresh image."
-      log "  $bv"
+      log "Attempting $ocpus OCPU / ${mem}GB in $ad, from the preserved boot volume."
       # No --image-id and no ssh metadata here: both come from the volume itself,
       # and passing an image alongside a source volume is rejected outright.
       out=$(oci compute instance launch \
         --compartment-id "$COMPARTMENT_OCID" \
         --availability-domain "$ad" \
         --shape "$SHAPE" \
-        --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEM_GB}" \
+        --shape-config "{\"ocpus\":$ocpus,\"memoryInGBs\":$mem}" \
         --source-boot-volume-id "$bv" \
         --subnet-id "$SUBNET_ID" \
         --assign-public-ip "$ASSIGN_PUBLIC_IP" \
@@ -80,12 +89,12 @@ try_launch() {
         --wait-for-state RUNNING 2>&1)
       rc=$?
     else
-      log "Attempting $SHAPE ($OCPUS OCPU / ${MEM_GB}GB) in $ad ..."
+      log "Attempting $SHAPE ($ocpus OCPU / ${mem}GB) in $ad ..."
       out=$(oci compute instance launch \
         --compartment-id "$COMPARTMENT_OCID" \
         --availability-domain "$ad" \
         --shape "$SHAPE" \
-        --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEM_GB}" \
+        --shape-config "{\"ocpus\":$ocpus,\"memoryInGBs\":$mem}" \
         --image-id "$IMAGE_OCID" \
         --subnet-id "$SUBNET_ID" \
         --assign-public-ip "$ASSIGN_PUBLIC_IP" \
@@ -102,16 +111,17 @@ try_launch() {
         --query 'data[0].id' --raw-output 2>/dev/null)
       PUBLIC_IP=$(oci compute instance list-vnics --instance-id "$instance_id" \
         --query 'data[0]."public-ip"' --raw-output 2>/dev/null || echo "n/a")
-      log "SUCCESS! Instance created in $ad: $instance_id (public IP: $PUBLIC_IP)"
+      WON_OCPUS="$ocpus"; WON_MEM="$mem"
+      log "SUCCESS! ${ocpus} OCPU / ${mem}GB created in $ad: $instance_id (public IP: $PUBLIC_IP)"
       return 0
     fi
 
     # Oracle refuses in several dialects; InternalError is the one it actually
     # uses for free-tier A1. All of them mean the same thing: come back later.
     if echo "$out" | grep -Eqi "Out of host capacity|InternalError|too ?many ?requests|LimitExceeded.*capacity|500"; then
-      log "No capacity in $ad. OCI said: $(echo "$out" | tr '\n' ' ' | head -c 200)"
+      log "No room for $ocpus/$mem in $ad. OCI said: $(echo "$out" | tr '\n' ' ' | head -c 160)"
       retryable=1
-      continue
+      continue   # next rung down: a smaller ask may still fit
     fi
 
     # Not a refusal at all - the request never reached a verdict. A dropped or
@@ -128,6 +138,7 @@ try_launch() {
     log "ERROR: launch failed in $ad for a non-capacity reason:"
     echo "$out" >&2
     return 1
+   done
   done
   [ "$retryable" -eq 1 ] && return 2
   return 1
@@ -209,7 +220,10 @@ while :; do
   log "--- Attempt #$attempt (elapsed ${SECONDS}s / budget ${deadline}s) ---"
   try_launch; rc=$?
   case $rc in
-    0) echo "PUBLIC_IP=$PUBLIC_IP" >>"${GITHUB_ENV:-/dev/null}"; emit success; exit 0 ;;
+    0) { echo "PUBLIC_IP=$PUBLIC_IP"
+         echo "WON_SHAPE=${WON_OCPUS} OCPU / ${WON_MEM}GB"
+         echo "SPARE_OCPUS=$(( OCPUS - WON_OCPUS ))"
+       } >>"${GITHUB_ENV:-/dev/null}"; emit success; exit 0 ;;
     1) emit error; exit 1 ;;
     2) : ;;  # out of capacity — keep trying
   esac

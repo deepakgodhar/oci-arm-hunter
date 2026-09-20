@@ -10,6 +10,9 @@ carries the tooling that recovered the data off the instance Oracle reclaimed.
   every attempt gets `InternalError`, which is how OCI says "no free-tier A1".
 - **`arm-hunter` still runs** every ~30 min via cron, looping internally for
   5.5h per run. Still enabled; it disables itself and opens an issue if it wins.
+  It walks a **shape ladder** (`SHAPE_LADDER=2/12,1/6`): a host with one spare
+  core refuses 2 OCPU but accepts 1, so asking only for the full allowance
+  turns down slots worth taking. Two 1-OCPU instances fit the same allowance.
 - **The data is recovered and the app is redeployed elsewhere** (below), so the
   hunt is now optional rather than load-bearing.
 
@@ -121,6 +124,18 @@ The host is `Etc/UTC` but the app's date math assumes IST, so
 An anonymous request to `/ws` returns 502 — that's correct, not a fault. The
 chat server destroys unauthenticated upgrades (`wsServer.ts:48`).
 
+## Why the last instance vanished
+
+Oracle reclaims **idle Always Free** compute: 95th-percentile CPU under 20%
+across a 7-day window. `market-genie` ran one lightly-used app and fit that
+profile. Anything won next is subject to the same clock — genuine multi-project
+load avoids it, a near-idle box does not. Paid accounts are widely said to be
+exempt, but I could not confirm that in Oracle's docs.
+
+Oracle also **halved the Always Free A1 allowance** from 4 OCPU / 24 GB to
+2 OCPU / 12 GB on 2026-06-15, unannounced. That is why the limits read 2/12 and
+not 4/24 — it is not a restriction specific to this tenancy.
+
 ## Open items
 
 - **Cron URLs are wrong.** Both workflows in `deepakgodhar/Project-Tracker`
@@ -129,7 +144,9 @@ chat server destroys unauthenticated upgrades (`wsServer.ts:48`).
   the July migration. They need to point at the new domain. `CRON_SECRET` is
   already an Actions secret there and matches what's deployed.
 - **Teardown not yet run.** The rescue box and clone are still up.
-- **The hunt** is still running; decide whether a free ARM box is still wanted.
+- **The hunt** continues. The goal is a *second* machine alongside a paid
+  Hostinger VPS, for side projects, at no cost — so PAYG was considered and
+  declined, and the 1 GB x86 micros are too small to be useful here.
 
 ## Conventions
 
