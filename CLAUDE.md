@@ -10,9 +10,10 @@ carries the tooling that recovered the data off the instance Oracle reclaimed.
   every attempt gets `InternalError`, which is how OCI says "no free-tier A1".
 - **`arm-hunter` still runs** every ~30 min via cron, looping internally for
   5.5h per run. Still enabled; it disables itself and opens an issue if it wins.
-  It walks a **shape ladder** (`SHAPE_LADDER=2/12,1/6`): a host with one spare
-  core refuses 2 OCPU but accepts 1, so asking only for the full allowance
-  turns down slots worth taking. Two 1-OCPU instances fit the same allowance.
+  It **rotates** `SHAPE_LADDER=2/12,1/6` one size per attempt: a host with one
+  spare core refuses 2 OCPU but accepts 1, so asking only for the full
+  allowance turns down slots worth taking. Two 1-OCPU instances fit the same
+  allowance. Rotation, not both-per-attempt — see the throttling note below.
 - **The data is recovered and the app is redeployed elsewhere** (below), so the
   hunt is now optional rather than load-bearing.
 
@@ -76,6 +77,13 @@ reintroduce them.
   (`SUCCEEDED`), not `TERMINATED`.
 - **E2.1.Micro has 1 GB RAM.** `dnf install` of anything large will thrash it
   into unresponsiveness for minutes. Do heavy work elsewhere.
+- **Oracle throttles launches roughly two minutes apart.** The first version of
+  the shape ladder tried 2/12 and then 1/6 inside a single attempt, ~105s apart.
+  The second call came back `TooManyRequests` **36 times out of 40**, so the
+  smaller size — the whole point — was never actually tested; it got a 429, not
+  a capacity verdict. Sizes now rotate one per 5-minute attempt, which returns a
+  real `InternalError`/success instead. Don't collapse them back into one
+  attempt without re-checking the error codes by size.
 - **Transient errors are not capacity errors, but both are retryable.** A
   dropped connection is no verdict on capacity; treating it as fatal used to
   kill a 5.5h run with hours of budget left. Genuine failures

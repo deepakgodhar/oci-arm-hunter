@@ -21,10 +21,15 @@ COMPARTMENT_OCID="${COMPARTMENT_OCID:-$OCI_CLI_TENANCY}"
 SHAPE="${SHAPE:-VM.Standard.A1.Flex}"
 OCPUS="${OCPUS:-2}"
 MEM_GB="${MEM_GB:-12}"
-# Sizes to try per attempt, largest first, as "ocpus/memGB". A host with one
-# spare core can satisfy 1/6 but refuses 2/12, so asking only for the full
-# allowance declines slots we would happily take. Half a machine beats none,
-# and two 1-OCPU instances fit the same 2 OCPU / 12 GB allowance as one 2-OCPU.
+# Sizes to ask for, as "ocpus/memGB", ROTATED one per attempt - not all tried
+# back to back. A host with one spare core refuses 2/12 and accepts 1/6, so
+# asking only for the full allowance declines slots worth taking; two 1-OCPU
+# instances fit the same allowance as one 2-OCPU anyway.
+#
+# They rotate because trying both inside one attempt does not work: Oracle
+# throttles launches ~105s apart, so the second call returned TooManyRequests
+# 36 times out of 40 and the smaller size was never really tested. One call
+# per 5-minute cycle gets a genuine capacity verdict instead of a 429.
 SHAPE_LADDER="${SHAPE_LADDER:-${OCPUS}/${MEM_GB},1/6}"
 INSTANCE_DISPLAY_NAME="${INSTANCE_DISPLAY_NAME:-market-genie}"
 VCN_DISPLAY_NAME="${VCN_DISPLAY_NAME:-arm-hunter-vcn}"
@@ -67,11 +72,11 @@ find_preserved_boot_volume() {
 }
 
 try_launch() {
-  local ad out rc instance_id retryable=0 bv spec ocpus mem
+  local spec="$1"
+  local ad out rc instance_id retryable=0 bv ocpus mem
+  ocpus="${spec%%/*}"; mem="${spec##*/}"
   for ad in "${ADS[@]}"; do
-   bv=$(find_preserved_boot_volume "$ad")
-   for spec in "${LADDER[@]}"; do
-    ocpus="${spec%%/*}"; mem="${spec##*/}"
+    bv=$(find_preserved_boot_volume "$ad")
 
     if [ -n "$bv" ] && [ "$bv" != "null" ]; then
       log "Attempting $ocpus OCPU / ${mem}GB in $ad, from the preserved boot volume."
@@ -121,7 +126,7 @@ try_launch() {
     if echo "$out" | grep -Eqi "Out of host capacity|InternalError|too ?many ?requests|LimitExceeded.*capacity|500"; then
       log "No room for $ocpus/$mem in $ad. OCI said: $(echo "$out" | tr '\n' ' ' | head -c 160)"
       retryable=1
-      continue   # next rung down: a smaller ask may still fit
+      continue   # next AD, if there is one
     fi
 
     # Not a refusal at all - the request never reached a verdict. A dropped or
@@ -138,7 +143,6 @@ try_launch() {
     log "ERROR: launch failed in $ad for a non-capacity reason:"
     echo "$out" >&2
     return 1
-   done
   done
   [ "$retryable" -eq 1 ] && return 2
   return 1
@@ -217,8 +221,9 @@ deadline=$(( LOOP_MINUTES * 60 ))
 attempt=0
 while :; do
   attempt=$((attempt + 1))
-  log "--- Attempt #$attempt (elapsed ${SECONDS}s / budget ${deadline}s) ---"
-  try_launch; rc=$?
+  spec="${LADDER[$(( (attempt - 1) % ${#LADDER[@]} ))]}"
+  log "--- Attempt #$attempt asking for $spec (elapsed ${SECONDS}s / budget ${deadline}s) ---"
+  try_launch "$spec"; rc=$?
   case $rc in
     0) { echo "PUBLIC_IP=$PUBLIC_IP"
          echo "WON_SHAPE=${WON_OCPUS} OCPU / ${WON_MEM}GB"
